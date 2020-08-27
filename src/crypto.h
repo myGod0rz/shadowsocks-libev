@@ -1,7 +1,7 @@
 /*
  * crypto.h - Define the enryptor's interface
  *
- * Copyright (C) 2013 - 2018, Max Lv <max.c.lv@gmail.com>
+ * Copyright (C) 2013 - 2019, Max Lv <max.c.lv@gmail.com>
  *
  * This file is part of the shadowsocks-libev.
  *
@@ -80,7 +80,7 @@ typedef mbedtls_md_info_t digest_type_t;
 #endif
 
 #ifndef BF_ERROR_RATE_FOR_SERVER
-#define BF_ERROR_RATE_FOR_SERVER 1e-6
+#define BF_ERROR_RATE_FOR_SERVER 1e-10
 #endif
 
 #ifndef BF_ERROR_RATE_FOR_CLIENT

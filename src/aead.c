@@ -1,7 +1,7 @@
 /*
  * aead.c - Manage AEAD ciphers
  *
- * Copyright (C) 2013 - 2018, Max Lv <max.c.lv@gmail.com>
+ * Copyright (C) 2013 - 2019, Max Lv <max.c.lv@gmail.com>
  *
  * This file is part of the shadowsocks-libev.
  *
@@ -168,12 +168,13 @@ aead_cipher_encrypt(cipher_ctx_t *cipher_ctx,
     switch (cipher_ctx->cipher->method) {
     case AES256GCM: // Only AES-256-GCM is supported by libsodium.
         if (cipher_ctx->aes256gcm_ctx != NULL) { // Use it if availble
-            err =  crypto_aead_aes256gcm_encrypt_afternm(c, &long_clen, m, mlen,
-                                          ad, adlen, NULL, n, cipher_ctx->aes256gcm_ctx);
+            err = crypto_aead_aes256gcm_encrypt_afternm(c, &long_clen, m, mlen,
+                                                        ad, adlen, NULL, n,
+                                                        (const aes256gcm_ctx *)cipher_ctx->aes256gcm_ctx);
             *clen = (size_t)long_clen; // it's safe to cast 64bit to 32bit length here
             break;
         }
-        // Otherwise, just use the mbedTLS one with crappy AES-NI.
+    // Otherwise, just use the mbedTLS one with crappy AES-NI.
     case AES192GCM:
     case AES128GCM:
 
@@ -217,11 +218,12 @@ aead_cipher_decrypt(cipher_ctx_t *cipher_ctx,
     case AES256GCM: // Only AES-256-GCM is supported by libsodium.
         if (cipher_ctx->aes256gcm_ctx != NULL) { // Use it if availble
             err = crypto_aead_aes256gcm_decrypt_afternm(p, &long_plen, NULL, m, mlen,
-                                          ad, adlen, n, cipher_ctx->aes256gcm_ctx);
+                                                        ad, adlen, n,
+                                                        (const aes256gcm_ctx *)cipher_ctx->aes256gcm_ctx);
             *plen = (size_t)long_plen; // it's safe to cast 64bit to 32bit length here
             break;
         }
-        // Otherwise, just use the mbedTLS one with crappy AES-NI.
+    // Otherwise, just use the mbedTLS one with crappy AES-NI.
     case AES192GCM:
     case AES128GCM:
         err = mbedtls_cipher_auth_decrypt(cipher_ctx->evp, n, nlen, ad, adlen,
@@ -242,6 +244,12 @@ aead_cipher_decrypt(cipher_ctx_t *cipher_ctx,
     default:
         return CRYPTO_ERROR;
     }
+
+    // The success return value ln libsodium and mbedTLS are both 0
+    if (err != 0)
+        // Although we never return any library specific value in the caller,
+        // here we still set the error code to CRYPTO_ERROR to avoid confusion.
+        err = CRYPTO_ERROR;
 
     return err;
 }
@@ -329,11 +337,11 @@ aead_cipher_ctx_init(cipher_ctx_t *cipher_ctx, int method, int enc)
     const cipher_kt_t *cipher = aead_get_cipher_type(method);
 
     if (method == AES256GCM && crypto_aead_aes256gcm_is_available()) {
-        cipher_ctx->aes256gcm_ctx = ss_malloc(sizeof(aes256gcm_ctx));
+        cipher_ctx->aes256gcm_ctx = ss_aligned_malloc(sizeof(aes256gcm_ctx));
         memset(cipher_ctx->aes256gcm_ctx, 0, sizeof(aes256gcm_ctx));
     } else {
         cipher_ctx->aes256gcm_ctx = NULL;
-        cipher_ctx->evp = ss_malloc(sizeof(cipher_evp_t));
+        cipher_ctx->evp           = ss_malloc(sizeof(cipher_evp_t));
         memset(cipher_ctx->evp, 0, sizeof(cipher_evp_t));
         cipher_evp_t *evp = cipher_ctx->evp;
         mbedtls_cipher_init(evp);
@@ -346,7 +354,6 @@ aead_cipher_ctx_init(cipher_ctx_t *cipher_ctx, int method, int enc)
         LOGE("Cipher %s not found in mbed TLS library", ciphername);
         FATAL("Cannot initialize mbed TLS cipher");
     }
-
 
 #ifdef SS_DEBUG
     dump("KEY", (char *)cipher_ctx->cipher->key, cipher_ctx->cipher->key_len);
@@ -378,9 +385,9 @@ aead_ctx_release(cipher_ctx_t *cipher_ctx)
     if (cipher_ctx->cipher->method >= CHACHA20POLY1305IETF) {
         return;
     }
-    
+
     if (cipher_ctx->aes256gcm_ctx != NULL) {
-        ss_free(cipher_ctx->aes256gcm_ctx);
+        ss_aligned_free(cipher_ctx->aes256gcm_ctx);
         return;
     }
 
@@ -405,6 +412,8 @@ aead_encrypt_all(buffer_t *plaintext, cipher_t *cipher, size_t capacity)
 
     /* copy salt to first pos */
     memcpy(ciphertext->data, cipher_ctx.salt, salt_len);
+
+    ppbloom_add((void *)cipher_ctx.salt, salt_len);
 
     aead_cipher_ctx_set_key(&cipher_ctx, 1);
 
@@ -550,6 +559,8 @@ aead_encrypt(buffer_t *plaintext, cipher_ctx_t *cipher_ctx, size_t capacity)
         memcpy(ciphertext->data, cipher_ctx->salt, salt_len);
         aead_cipher_ctx_set_key(cipher_ctx, 1);
         cipher_ctx->init = 1;
+
+        ppbloom_add((void *)cipher_ctx->salt, salt_len);
     }
 
     err = aead_chunk_encrypt(cipher_ctx,
@@ -585,7 +596,7 @@ aead_chunk_decrypt(cipher_ctx_t *ctx, uint8_t *p, uint8_t *c, uint8_t *n,
         return CRYPTO_ERROR;
     assert(*plen == CHUNK_SIZE_LEN);
 
-    mlen = ntohs(*(uint16_t *)len_buf);
+    mlen = load16_be(len_buf);
     mlen = mlen & CHUNK_SIZE_MASK;
 
     if (mlen == 0)
@@ -605,9 +616,6 @@ aead_chunk_decrypt(cipher_ctx_t *ctx, uint8_t *p, uint8_t *c, uint8_t *n,
     assert(*plen == mlen);
 
     sodium_increment(n, nlen);
-
-    if (*clen > chunk_len)
-        memmove(c, c + chunk_len, *clen - chunk_len);
 
     *clen = *clen - chunk_len;
 
@@ -645,12 +653,12 @@ aead_decrypt(buffer_t *ciphertext, cipher_ctx_t *cipher_ctx, size_t capacity)
 
         memcpy(cipher_ctx->salt, cipher_ctx->chunk->data, salt_len);
 
-        aead_cipher_ctx_set_key(cipher_ctx, 0);
-
         if (ppbloom_check((void *)cipher_ctx->salt, salt_len) == 1) {
             LOGE("crypto: AEAD: repeat salt detected");
             return CRYPTO_ERROR;
         }
+
+        aead_cipher_ctx_set_key(cipher_ctx, 0);
 
         memmove(cipher_ctx->chunk->data, cipher_ctx->chunk->data + salt_len,
                 cipher_ctx->chunk->len - salt_len);
@@ -660,22 +668,27 @@ aead_decrypt(buffer_t *ciphertext, cipher_ctx_t *cipher_ctx, size_t capacity)
     }
 
     size_t plen = 0;
+    size_t cidx = 0;
     while (cipher_ctx->chunk->len > 0) {
         size_t chunk_clen = cipher_ctx->chunk->len;
         size_t chunk_plen = 0;
         err = aead_chunk_decrypt(cipher_ctx,
                                  (uint8_t *)plaintext->data + plen,
-                                 (uint8_t *)cipher_ctx->chunk->data,
+                                 (uint8_t *)cipher_ctx->chunk->data + cidx,
                                  cipher_ctx->nonce, &chunk_plen, &chunk_clen);
         if (err == CRYPTO_ERROR) {
             return err;
         } else if (err == CRYPTO_NEED_MORE) {
             if (plen == 0)
                 return err;
-            else
+            else{
+                memmove((uint8_t *)cipher_ctx->chunk->data, 
+			(uint8_t *)cipher_ctx->chunk->data + cidx, chunk_clen);
                 break;
+            }
         }
         cipher_ctx->chunk->len = chunk_clen;
+        cidx += cipher_ctx->cipher->tag_len * 2 + CHUNK_SIZE_LEN + chunk_plen;
         plen                  += chunk_plen;
     }
     plaintext->len = plen;
